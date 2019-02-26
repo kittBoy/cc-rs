@@ -1220,7 +1220,7 @@ impl Build {
                 // (x86 Android doesn't say "eabi")
                 if target.contains("-androideabi") && target.contains("v7") {
                     // -march=armv7-a handled above
-                    cmd.args.push("-mthumb".into());
+                    cmd.args.push("-marm".into());
                     if !target.contains("neon") {
                         // On android we can guarantee some extra float instructions
                         // (specified in the android spec online)
