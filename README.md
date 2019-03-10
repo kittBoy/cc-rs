@@ -77,6 +77,7 @@ number of different environment variables.
          certain `TARGET`s, it also is assumed to know about other flags (most
          common is `-fPIC`).
 * `AR` - the `ar` (archiver) executable to use to build the static library.
+* `CRATE_CC_NO_DEFAULTS` - the default compiler flags may cause conflicts in some cross compiling scenarios. Setting this variable will disable the generation of default compiler flags.
 
 Each of these variables can also be supplied with certain prefixes and suffixes,
 in the following prioritized order:
@@ -88,7 +89,7 @@ in the following prioritized order:
 
 If none of these variables exist, cc-rs uses built-in defaults
 
-In addition to the the above optional environment variables, `cc-rs` has some
+In addition to the above optional environment variables, `cc-rs` has some
 functions with hard requirements on some variables supplied by [cargo's
 build-script driver][cargo] that it has the `TARGET`, `OUT_DIR`, `OPT_LEVEL`,
 and `HOST` variables.

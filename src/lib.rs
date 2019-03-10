@@ -956,7 +956,7 @@ impl Build {
     fn compile_objects(&self, objs: &[Object]) -> Result<(), Error> {
         use self::rayon::prelude::*;
 
-        if let Ok(amt) = env::var("NUM_JOBS") {
+        if let Some(amt) = self.getenv("NUM_JOBS") {
             if let Ok(amt) = amt.parse() {
                 let _ = rayon::ThreadPoolBuilder::new()
                     .num_threads(amt)
@@ -1093,7 +1093,78 @@ impl Build {
         let target = self.get_target()?;
 
         let mut cmd = self.get_base_compiler()?;
+        let envflags = self.envflags(if self.cpp { "CXXFLAGS" } else { "CFLAGS" });
 
+        // Disable default flag generation via environment variable or when
+        // certain cross compiling arguments are set
+        let use_defaults = self.getenv("CRATE_CC_NO_DEFAULTS").is_none()
+            && !(envflags.iter().any(|ref arg| {
+                arg.starts_with("-m") || arg.starts_with("/arch") || arg.starts_with("--target")
+            }));
+
+        if use_defaults {
+            self.add_default_flags(&mut cmd, &target, &opt_level)?;
+        } else {
+            println!("Info: default compiler flags are disabled");
+        }
+
+        for arg in envflags {
+            cmd.push_cc_arg(arg.into());
+        }
+
+        for directory in self.include_directories.iter() {
+            cmd.args.push(cmd.family.include_flag().into());
+            cmd.args.push(directory.into());
+        }
+
+        // If warnings and/or extra_warnings haven't been explicitly set,
+        // then we set them only if the environment doesn't already have
+        // CFLAGS/CXXFLAGS, since those variables presumably already contain
+        // the desired set of warnings flags.
+
+        if self.warnings.unwrap_or(if self.has_flags() { false } else { true }) {
+            let wflags = cmd.family.warnings_flags().into();
+            cmd.push_cc_arg(wflags);
+        }
+
+        if self.extra_warnings.unwrap_or(if self.has_flags() { false } else { true }) {
+            if let Some(wflags) = cmd.family.extra_warnings_flags() {
+                cmd.push_cc_arg(wflags.into());
+            }
+        }
+
+        for flag in self.flags.iter() {
+            cmd.args.push(flag.into());
+        }
+
+        for flag in self.flags_supported.iter() {
+            if self.is_flag_supported(flag).unwrap_or(false) {
+                cmd.push_cc_arg(flag.into());
+            }
+        }
+
+        for &(ref key, ref value) in self.definitions.iter() {
+            let lead = if let ToolFamily::Msvc { .. } = cmd.family {
+                "/"
+            } else {
+                "-"
+            };
+            if let Some(ref value) = *value {
+                cmd.args.push(format!("{}D{}={}", lead, key, value).into());
+            } else {
+                cmd.args.push(format!("{}D{}", lead, key).into());
+            }
+        }
+
+        if self.warnings_into_errors {
+            let warnings_to_errors_flag = cmd.family.warnings_to_errors_flag().into();
+            cmd.push_cc_arg(warnings_to_errors_flag);
+        }
+
+        Ok(cmd)
+    }
+
+    fn add_default_flags(&self, cmd: &mut Tool, target: &str, opt_level: &str) -> Result<(), Error> {
         // Non-target flags
         // If the flag is not conditioned on target variable, it belongs here :)
         match cmd.family {
@@ -1108,7 +1179,7 @@ impl Build {
                     Some(false) => "/MD",
                     None => {
                         let features =
-                            env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or(String::new());
+                            self.getenv("CARGO_CFG_TARGET_FEATURE").unwrap_or(String::new());
                         if features.contains("crt-static") {
                             "/MT"
                         } else {
@@ -1120,9 +1191,9 @@ impl Build {
 
                 match &opt_level[..] {
                     // Msvc uses /O1 to enable all optimizations that minimize code size.
-                    "z" | "s" | "1" => cmd.args.push("/O1".into()),
+                    "z" | "s" | "1" => cmd.push_opt_unless_duplicate("/O1".into()),
                     // -O3 is a valid value for gcc and clang compilers, but not msvc. Cap to /O2.
-                    "2" | "3" => cmd.args.push("/O2".into()),
+                    "2" | "3" => cmd.push_opt_unless_duplicate("/O2".into()),
                     _ => {}
                 }
             }
@@ -1130,9 +1201,9 @@ impl Build {
                 // arm-linux-androideabi-gcc 4.8 shipped with Android NDK does
                 // not support '-Oz'
                 if opt_level == "z" && cmd.family != ToolFamily::Clang {
-                    cmd.args.push("-Os".into());
+                    cmd.push_opt_unless_duplicate("-Os".into());
                 } else {
-                    cmd.args.push(format!("-O{}", opt_level).into());
+                    cmd.push_opt_unless_duplicate(format!("-O{}", opt_level).into());
                 }
 
                 if !target.contains("-ios") {
@@ -1149,9 +1220,6 @@ impl Build {
                 }
             }
         }
-        for arg in self.envflags(if self.cpp { "CXXFLAGS" } else { "CFLAGS" }) {
-            cmd.args.push(arg.into());
-        }
 
         if self.get_debug() {
             if self.cuda {
@@ -1159,7 +1227,7 @@ impl Build {
                 cmd.args.push(nvcc_debug_flag);
             }
             let family = cmd.family;
-            family.add_debug_flags(&mut cmd);
+            family.add_debug_flags(cmd);
         }
 
         // Target flags
@@ -1206,7 +1274,7 @@ impl Build {
                 }
 
                 if self.static_flag.is_none() {
-                    let features = env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or(String::new());
+                    let features = self.getenv("CARGO_CFG_TARGET_FEATURE").unwrap_or(String::new());
                     if features.contains("crt-static") {
                         cmd.args.push("-static".into());
                     }
@@ -1346,7 +1414,7 @@ impl Build {
         if target.contains("-ios") {
             // FIXME: potential bug. iOS is always compiled with Clang, but Gcc compiler may be
             // detected instead.
-            self.ios_flags(&mut cmd)?;
+            self.ios_flags(cmd)?;
         }
 
         if self.static_flag.unwrap_or(false) {
@@ -1372,56 +1440,7 @@ impl Build {
             }
         }
 
-        for directory in self.include_directories.iter() {
-            cmd.args.push(cmd.family.include_flag().into());
-            cmd.args.push(directory.into());
-        }
-
-        // If warnings and/or extra_warnings haven't been explicitly set,
-        // then we set them only if the environment doesn't already have
-        // CFLAGS/CXXFLAGS, since those variables presumably already contain
-        // the desired set of warnings flags.
-
-        if self.warnings.unwrap_or(if self.has_flags() { false } else { true }) {
-            let wflags = cmd.family.warnings_flags().into();
-            cmd.push_cc_arg(wflags);
-        }
-
-        if self.extra_warnings.unwrap_or(if self.has_flags() { false } else { true }) {
-            if let Some(wflags) = cmd.family.extra_warnings_flags() {
-                cmd.push_cc_arg(wflags.into());
-            }
-        }
-
-        for flag in self.flags.iter() {
-            cmd.args.push(flag.into());
-        }
-
-        for flag in self.flags_supported.iter() {
-            if self.is_flag_supported(flag).unwrap_or(false) {
-                cmd.push_cc_arg(flag.into());
-            }
-        }
-
-        for &(ref key, ref value) in self.definitions.iter() {
-            let lead = if let ToolFamily::Msvc { .. } = cmd.family {
-                "/"
-            } else {
-                "-"
-            };
-            if let Some(ref value) = *value {
-                cmd.args.push(format!("{}D{}={}", lead, key, value).into());
-            } else {
-                cmd.args.push(format!("{}D{}", lead, key).into());
-            }
-        }
-
-        if self.warnings_into_errors {
-            let warnings_to_errors_flag = cmd.family.warnings_to_errors_flag().into();
-            cmd.push_cc_arg(warnings_to_errors_flag);
-        }
-
-        Ok(cmd)
+        Ok(())
     }
 
     fn has_flags(&self) -> bool {
@@ -1717,6 +1736,8 @@ impl Build {
                     }
                 } else if target.contains("cloudabi") {
                     format!("{}-{}", target, traditional)
+                } else if target == "wasm32-unknown-wasi" {
+                    "clang".to_string()
                 } else if self.get_host()? != target {
                     // CROSS_COMPILE is of the form: "arm-linux-gnueabi-"
                     let cc_env = self.getenv("CROSS_COMPILE");
@@ -2102,6 +2123,41 @@ impl Tool {
             self.args.push(self.family.nvcc_redirect_flag().into());
         }
         self.args.push(flag);
+    }
+
+    fn is_duplicate_opt_arg(&self, flag: &OsString) -> bool {
+        let flag = flag.to_str().unwrap();
+        let mut chars = flag.chars();
+
+        // Only duplicate check compiler flags
+        if self.is_like_msvc() {
+            if chars.next() != Some('/') {
+                return false;
+            }
+        } else if self.is_like_gnu() || self.is_like_clang() {
+            if chars.next() != Some('-') {
+                return false;
+            }
+        }
+
+        // Check for existing optimization flags (-O, /O)
+        if chars.next() == Some('O') {
+            return self.args().iter().any(|ref a|
+                a.to_str().unwrap_or("").chars().nth(1) == Some('O')
+            );
+        }
+
+        // TODO Check for existing -m..., -m...=..., /arch:... flags
+        return false;
+    }
+
+    /// Don't push optimization arg if it conflicts with existing args
+    fn push_opt_unless_duplicate(&mut self, flag: OsString) {
+        if self.is_duplicate_opt_arg(&flag) {
+            println!("Info: Ignoring duplicate arg {:?}", &flag);
+        } else {
+            self.push_cc_arg(flag);
+        }
     }
 
     /// Converts this compiler into a `Command` that's ready to be run.
